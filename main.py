@@ -45,19 +45,25 @@ mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=False, model_complexity=0,
                     min_detection_confidence=0.45, min_tracking_confidence=0.4)
 
-# ===== Pi Camera setup with OpenCV =====
-camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
-if not camera.isOpened():
-    print("[ERROR] Cannot open camera with V4L2, trying default...")
-    camera = cv2.VideoCapture(0)
-camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-camera.set(cv2.CAP_PROP_FPS, 30)
-ret, test_frame = camera.read()
-if ret:
-    print(f"[CAMERA] Pi Camera OK - Frame size: {test_frame.shape}")
+# ===== Pi Camera via rpicam-vid TCP stream =====
+import subprocess
+import os
+
+# Start rpicam-vid in background
+print("[CAMERA] Starting rpicam-vid...")
+rpicam_process = subprocess.Popen([
+    'rpicam-vid', '-t', '0', '--width', '640', '--height', '480',
+    '--framerate', '30', '--inline', '--listen', '-o', 'tcp://0.0.0.0:8080'
+], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+time.sleep(3)  # Wait for camera to start
+
+# Connect to TCP stream
+camera = cv2.VideoCapture('tcp://127.0.0.1:8080')
+if camera.isOpened():
+    print("[CAMERA] Connected to rpicam-vid stream")
 else:
-    print("[ERROR] Camera not working! Check 'rpicam-hello' and enable legacy camera.")
+    print("[ERROR] Cannot connect to rpicam stream")
 
 # ===== helpers: pose -> legs/center detection =====
 def is_legs_visible(lm):
@@ -112,7 +118,6 @@ def tracking_loop():
     while running:
         ret, frame = camera.read()
         if not ret or frame is None:
-            print("[WARNING] No frame from camera")
             time.sleep(0.05)
             continue
 
