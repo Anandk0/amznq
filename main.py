@@ -3,15 +3,13 @@ from flask import Flask, render_template_string, Response
 import threading
 import time
 import socket
-import requests
 import cv2
 import numpy as np
 import mediapipe as mp
+from picamera2 import Picamera2
 
 # ===== CONFIG =====
-ESP32_STREAM_URL = "http://10.30.152.68/stream"   # MJPEG stream URL
-ESP8266_IP = "10.30.152.186"
-                      # robot UDP IP
+ESP8266_IP = "10.30.152.186"  # robot UDP IP
 ESP8266_PORT = 8888
 
 FRAME_W = 400
@@ -48,54 +46,12 @@ mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=False, model_complexity=0,
                     min_detection_confidence=0.45, min_tracking_confidence=0.4)
 
-# ===== MJPEG reader thread (reconnect-friendly) =====
-class MJPEGStreamThread:
-    def __init__(self, url):
-        self.url = url
-        self.frame = None
-        self.running = True
-        self.thread = threading.Thread(target=self.update, daemon=True)
-        self.thread.start()
-
-    def update(self):
-        backoff = 1.0
-        while self.running:
-            try:
-                r = requests.get(self.url, stream=True, timeout=6)
-                if r.status_code != 200:
-                    r.close()
-                    time.sleep(backoff); backoff = min(8.0, backoff*2)
-                    continue
-                bytes_data = b''
-                backoff = 1.0
-                for chunk in r.iter_content(chunk_size=2048):
-                    if not self.running:
-                        break
-                    if not chunk:
-                        continue
-                    bytes_data += chunk
-                    a = bytes_data.find(b'\xff\xd8')
-                    b = bytes_data.find(b'\xff\xd9')
-                    if a != -1 and b != -1 and b > a:
-                        jpg = bytes_data[a:b+2]
-                        bytes_data = bytes_data[b+2:]
-                        frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                        if frame is not None:
-                            self.frame = frame
-                try:
-                    r.close()
-                except:
-                    pass
-            except Exception as e:
-                print("[STREAM] error:", e)
-                time.sleep(backoff)
-                backoff = min(8.0, backoff*2)
-
-    def read(self):
-        return self.frame
-
-    def stop(self):
-        self.running = False
+# ===== Pi Camera 2 setup =====
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
+picam2.configure(config)
+picam2.start()
+print("[PICAM2] Camera started")
 
 # ===== helpers: pose -> legs/center detection =====
 def is_legs_visible(lm):
@@ -144,12 +100,11 @@ def send_udp_if_changed(cmd):
 # ===== tracking state machine (single-turn strategy + scan) =====
 def tracking_loop():
     global output_frame, current_mode
-    loader = MJPEGStreamThread(ESP32_STREAM_URL)
     smooth_buf = []
     scan_step_count = 0
 
     while running:
-        frame = loader.read()
+        frame = picam2.capture_array()
         if frame is None:
             time.sleep(0.05)
             continue
