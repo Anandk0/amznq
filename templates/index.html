@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hybrid Robot Controller</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; margin: 0; background: #1a1a1a; color: white; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .video-container { text-align: center; margin-bottom: 30px; }
+        .video-feed { max-width: 100%; height: auto; border: 2px solid #333; }
+        .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 30px; }
+        .mode-panel, .manual-panel { background: #2a2a2a; padding: 20px; border-radius: 10px; }
+        .mode-btn { width: 100%; padding: 15px; margin: 5px 0; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        .mode-btn.active { background: #4CAF50; color: white; }
+        .mode-btn:not(.active) { background: #555; color: white; }
+        .control-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 20px; }
+        .control-btn { padding: 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 18px; background: #007bff; color: white; }
+        .control-btn:active { background: #0056b3; }
+        .status { text-align: center; margin-top: 20px; padding: 10px; background: #333; border-radius: 5px; }
+        .empty { grid-column: span 1; }
+        @media (max-width: 768px) {
+            .controls { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 Hybrid Robot Controller</h1>
+        </div>
+        
+        <div class="video-container">
+            <img src="/video_feed" class="video-feed" alt="Robot Camera Feed">
+        </div>
+        
+        <div class="controls">
+            <div class="mode-panel">
+                <h3>Control Modes</h3>
+                <button class="mode-btn active" onclick="setMode('manual')" id="manual-btn">
+                    📱 Manual Control
+                </button>
+                <button class="mode-btn" onclick="setMode('human_follow')" id="human-btn">
+                    👤 Human Following
+                </button>
+                <button class="mode-btn" onclick="setMode('object_follow')" id="object-btn">
+                    🎯 Object Following (Auto)
+                </button>
+            </div>
+            
+            <div class="manual-panel">
+                <h3>Manual Controls</h3>
+                <div class="control-grid">
+                    <div class="empty"></div>
+                    <button class="control-btn" onmousedown="sendCommand('forward')" onmouseup="sendCommand('stop')">⬆️</button>
+                    <div class="empty"></div>
+                    <button class="control-btn" onmousedown="sendCommand('left')" onmouseup="sendCommand('stop')">⬅️</button>
+                    <button class="control-btn" onclick="sendCommand('stop')">⏹️</button>
+                    <button class="control-btn" onmousedown="sendCommand('right')" onmouseup="sendCommand('stop')">➡️</button>
+                    <div class="empty"></div>
+                    <button class="control-btn" onmousedown="sendCommand('backward')" onmouseup="sendCommand('stop')">⬇️</button>
+                    <div class="empty"></div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="status" id="status">
+            Mode: Manual | Status: Stopped
+        </div>
+    </div>
+
+    <script>
+        let currentMode = 'manual';
+        
+        function setMode(mode) {
+            fetch('/control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({command: 'set_mode', mode: mode})
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    currentMode = mode;
+                    updateModeButtons();
+                    updateStatus();
+                }
+            });
+        }
+        
+        function sendCommand(command) {
+            if (currentMode !== 'manual') return;
+            
+            fetch('/control', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({command: command})
+            })
+            .then(response => response.json())
+            .then(data => {
+                updateStatus();
+            });
+        }
+        
+        function updateModeButtons() {
+            document.querySelectorAll('.mode-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.getElementById(currentMode + '-btn').classList.add('active');
+            
+            const manualPanel = document.querySelector('.manual-panel');
+            manualPanel.style.opacity = currentMode === 'manual' ? '1' : '0.5';
+        }
+        
+        function updateStatus() {
+            fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                const modeText = {
+                    'manual': 'Manual Control',
+                    'human_follow': 'Human Following',
+                    'object_follow': 'Object Following'
+                };
+                document.getElementById('status').textContent = 
+                    `Mode: ${modeText[data.mode]} | Status: ${data.status} | IP: ${data.esp8266_ip}`;
+            });
+        }
+        
+        // Update status every 2 seconds
+        setInterval(updateStatus, 2000);
+        updateStatus();
+    </script>
+</body>
+</html>
