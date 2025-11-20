@@ -6,7 +6,6 @@ import socket
 import cv2
 import numpy as np
 import mediapipe as mp
-from picamera2 import Picamera2
 
 # ===== CONFIG =====
 ESP8266_IP = "10.30.152.186"  # robot UDP IP
@@ -46,12 +45,12 @@ mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=False, model_complexity=0,
                     min_detection_confidence=0.45, min_tracking_confidence=0.4)
 
-# ===== Pi Camera 2 setup =====
-picam2 = Picamera2()
-config = picam2.create_preview_configuration(main={"size": (640, 480), "format": "RGB888"})
-picam2.configure(config)
-picam2.start()
-print("[PICAM2] Camera started")
+# ===== Pi Camera setup with OpenCV =====
+camera = cv2.VideoCapture(0)
+camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+camera.set(cv2.CAP_PROP_FPS, 30)
+print("[CAMERA] Pi Camera started via OpenCV")
 
 # ===== helpers: pose -> legs/center detection =====
 def is_legs_visible(lm):
@@ -104,8 +103,8 @@ def tracking_loop():
     scan_step_count = 0
 
     while running:
-        frame = picam2.capture_array()
-        if frame is None:
+        ret, frame = camera.read()
+        if not ret or frame is None:
             time.sleep(0.05)
             continue
 
