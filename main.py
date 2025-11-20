@@ -46,11 +46,18 @@ pose = mp_pose.Pose(static_image_mode=False, model_complexity=0,
                     min_detection_confidence=0.45, min_tracking_confidence=0.4)
 
 # ===== Pi Camera setup with OpenCV =====
-camera = cv2.VideoCapture(0)
+camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
+if not camera.isOpened():
+    print("[ERROR] Cannot open camera with V4L2, trying default...")
+    camera = cv2.VideoCapture(0)
 camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 camera.set(cv2.CAP_PROP_FPS, 30)
-print("[CAMERA] Pi Camera started via OpenCV")
+ret, test_frame = camera.read()
+if ret:
+    print(f"[CAMERA] Pi Camera OK - Frame size: {test_frame.shape}")
+else:
+    print("[ERROR] Camera not working! Check 'rpicam-hello' and enable legacy camera.")
 
 # ===== helpers: pose -> legs/center detection =====
 def is_legs_visible(lm):
@@ -105,6 +112,7 @@ def tracking_loop():
     while running:
         ret, frame = camera.read()
         if not ret or frame is None:
+            print("[WARNING] No frame from camera")
             time.sleep(0.05)
             continue
 
