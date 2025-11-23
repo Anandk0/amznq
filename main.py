@@ -5,7 +5,16 @@ import time
 import socket
 import cv2
 import numpy as np
-import mediapipe as mp
+import sys
+
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    try:
+        import tensorflow.lite as tflite
+    except ImportError:
+        print("ERROR: Install tensorflow")
+        sys.exit(1)
 
 # ===== CONFIG =====
 ESP8266_IP = "10.30.152.186"  # robot UDP IP
@@ -14,19 +23,12 @@ ESP8266_PORT = 8888
 FRAME_W = 320
 FRAME_H = 240
 
-# timings & tuning
-CMD_MIN_INTERVAL = 0.08     # seconds
-SCAN_WAIT = 1.0             # seconds: wait after a single-turn for fresh frames
-TURN_STEP_MS = 350          # ESP single-turn duration (ms)
-MAX_SCAN_STEPS = 12         # how many steps to try scanning 360
-SMOOTH_WINDOW = 3
-FRAME_SKIP = 1              # process every Nth frame
+# TFLite model
+MODEL_PATH = "ei-model.tflite"
+CONFIDENCE_THRESHOLD = 0.75
 
-# visibility thresholds
-SHOULDER_VIS = 0.3
-KNEE_VIS = 0.2
-ANKLE_VIS = 0.2
-NOSE_VIS = 0.25
+CMD_MIN_INTERVAL = 0.08
+FRAME_SKIP = 2
 
 # ===== GLOBALS =====
 app = Flask(__name__)
@@ -41,11 +43,17 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 last_send_time = 0.0
 last_sent_cmd = None
 
-# mediapipe
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=False, model_complexity=0,
-                    min_detection_confidence=0.3, min_tracking_confidence=0.3,
-                    enable_segmentation=False, smooth_landmarks=True)
+# TFLite setup
+interpreter = tflite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+input_shape = input_details[0]['shape']
+input_height = input_shape[1]
+input_width = input_shape[2]
+input_channels = input_shape[3]
+input_index = input_details[0]['index']
+is_fomo = len(output_details) == 1 and len(output_details[0]['shape']) == 4
 
 # ===== Pi Camera via rpicam-vid TCP stream =====
 import subprocess
@@ -67,28 +75,11 @@ if camera.isOpened():
 else:
     print("[ERROR] Cannot connect to rpicam stream")
 
-# ===== helpers: pose -> legs/center detection =====
-def is_legs_visible(lm):
-    left_knee = lm[mp_pose.PoseLandmark.LEFT_KNEE]
-    right_knee = lm[mp_pose.PoseLandmark.RIGHT_KNEE]
-    left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
-    right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
-    v = 0
-    if left_knee.visibility >= KNEE_VIS or right_knee.visibility >= KNEE_VIS:
-        v += 1
-    if left_ankle.visibility >= ANKLE_VIS or right_ankle.visibility >= ANKLE_VIS:
-        v += 1
-    return v >= 1
-
-def compute_center_x_from_pose(lm, W):
-    ls = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
-    rs = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-    nose = lm[mp_pose.PoseLandmark.NOSE]
-    if ls.visibility >= SHOULDER_VIS and rs.visibility >= SHOULDER_VIS:
-        return int(((ls.x + rs.x)/2.0) * W)
-    if nose.visibility >= NOSE_VIS:
-        return int(nose.x * W)
-    return None
+def send_burst(command, times, delay=0.05):
+    for _ in range(times):
+        sock.sendto(command.encode(), (ESP8266_IP, ESP8266_PORT))
+        time.sleep(delay)
+    sock.sendto("STOP".encode(), (ESP8266_IP, ESP8266_PORT))
 
 # ===== UDP sending helpers (rate-limited, send-on-change) =====
 def send_udp_once(cmd):
@@ -111,13 +102,9 @@ def send_udp_if_changed(cmd):
         return
     send_udp_once(cmd)
 
-# ===== tracking state machine (single-turn strategy + scan) =====
 def tracking_loop():
     global output_frame, current_mode
-    smooth_buf = []
-    scan_step_count = 0
     frame_count = 0
-    last_ultrasonic_state = None
 
     while running:
         ret, frame = camera.read()
@@ -133,85 +120,78 @@ def tracking_loop():
 
         if mode_now == "AUTO":
             frame_count += 1
-            detected = False
-            legs = False
-            cx = None
-            
-            # Skip frames for performance
-            if frame_count % FRAME_SKIP == 0:
-                # pose detection
-                image_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                results = pose.process(image_rgb)
+            if frame_count % FRAME_SKIP != 0:
+                with frame_lock:
+                    output_frame = img.copy()
+                continue
 
-                if results.pose_landmarks:
-                    lm = results.pose_landmarks.landmark
-                    # leg detection: use knees/ankles visibility
-                    left_knee = lm[mp_pose.PoseLandmark.LEFT_KNEE]
-                    right_knee = lm[mp_pose.PoseLandmark.RIGHT_KNEE]
-                    left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
-                    right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
-                    legs = ((left_knee.visibility >= KNEE_VIS) or (right_knee.visibility >= KNEE_VIS) or
-                            (left_ankle.visibility >= ANKLE_VIS) or (right_ankle.visibility >= ANKLE_VIS))
-
-                    cx = compute_center_x_from_pose(lm, W)
-                    if cx is not None:
-                        smooth_buf.append(cx)
-                        if len(smooth_buf) > SMOOTH_WINDOW:
-                            smooth_buf.pop(0)
-                        cx = int(sum(smooth_buf) / len(smooth_buf))
-                        detected = True
-
-                # ultrasonic control: send only on state change
-                ultrasonic_state = "ULTRASONIC_ON" if legs else "ULTRASONIC_OFF"
-                if ultrasonic_state != last_ultrasonic_state:
-                    send_udp_once(ultrasonic_state)
-                    last_ultrasonic_state = ultrasonic_state
-
-            if detected and legs:
-                # reset scanning
-                scan_step_count = 0
-                # zones
-                z1 = W * 0.25; z2 = W * 0.40; z3 = W * 0.60; z4 = W * 0.75
-                if cx < z1:
-                    action = "TURN_RIGHT_ONCE"
-                elif cx < z2:
-                    action = "TURN_RIGHT_ONCE"
-                elif cx < z3:
-                    action = "FORWARD"
-                elif cx < z4:
-                    action = "TURN_LEFT_ONCE"
-                else:
-                    action = "TURN_LEFT_ONCE"
-
-                if action == "FORWARD":
-                    send_udp_if_changed("FORWARD")
-                else:
-                    # send single-turn and wait for SCAN_WAIT so ESP has time to turn & camera to update
-                    send_udp_once(action)
-                    t0 = time.time()
-                    while time.time() - t0 < SCAN_WAIT:
-                        time.sleep(0.05)
-                    # after wait, loop will re-evaluate on fresh frames
+            # TFLite inference
+            img_resized = cv2.resize(img, (input_width, input_height), interpolation=cv2.INTER_NEAREST)
+            if input_channels == 1:
+                img_processed = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+                img_processed = np.expand_dims(img_processed, axis=-1)
             else:
-                # SCAN mode: legs not visible -> perform single-turn scanning steps
-                if scan_step_count < MAX_SCAN_STEPS:
-                    send_udp_once("TURN_LEFT_ONCE")
-                    scan_step_count += 1
-                    t0 = time.time()
-                    while time.time() - t0 < SCAN_WAIT:
-                        time.sleep(0.05)
-                    # next iteration will check again for detection
-                else:
-                    # completed scan -> STOP and pause
-                    send_udp_if_changed("STOP")
-                    scan_step_count = 0
-                    time.sleep(0.5)
+                img_processed = img_resized[:, :, ::-1]
+            
+            input_data = np.expand_dims(img_processed, axis=0)
+            if input_details[0]['dtype'] == np.float32:
+                input_data = np.float32(input_data) / 255.0
+            elif input_details[0]['dtype'] == np.int8:
+                input_data = (input_data.astype(np.int16) - 128).astype(np.int8)
+            
+            interpreter.set_tensor(input_index, input_data)
+            interpreter.invoke()
 
-        # update output frame
+            detected = False
+            center_x = 0
+
+            if is_fomo:
+                output_data = interpreter.get_tensor(output_details[0]['index'])[0]
+                if output_details[0]['dtype'] == np.int8:
+                    output_data = (output_data.astype(np.float32) + 128) / 255.0
+                if output_data.shape[2] > 1:
+                    output_data = output_data[:, :, 1:]
+                
+                max_idx = np.argmax(output_data)
+                max_y, max_x, max_c = np.unravel_index(max_idx, output_data.shape)
+                max_val = output_data[max_y, max_x, max_c]
+
+                if max_val > CONFIDENCE_THRESHOLD:
+                    detected = True
+                    grid_h, grid_w, _ = output_data.shape
+                    center_x = int((max_x + 0.5) * (W / grid_w))
+                    center_y = int((max_y + 0.5) * (H / grid_h))
+                    cv2.circle(img, (center_x, center_y), 12, (0, 255, 0), 2)
+            else:
+                boxes = interpreter.get_tensor(output_details[0]['index'])[0]
+                scores = interpreter.get_tensor(output_details[2]['index'])[0]
+                best_idx = np.argmax(scores)
+                if scores[best_idx] > CONFIDENCE_THRESHOLD:
+                    ymin, xmin, ymax, xmax = boxes[best_idx]
+                    center_x = int((xmin + xmax) / 2 * W)
+                    center_y = int((ymin + ymax) / 2 * H)
+                    detected = True
+                    cv2.rectangle(img, (int(xmin*W), int(ymin*H)), (int(xmax*W), int(ymax*H)), (0,255,0), 2)
+
+            # Control logic
+            if detected:
+                z1 = W * 0.25; z2 = W * 0.40; z3 = W * 0.60; z4 = W * 0.75
+                if center_x < z1:
+                    send_burst("LEFT", 5)
+                elif center_x < z2:
+                    send_burst("LEFT", 2)
+                elif center_x <= z3:
+                    send_udp_if_changed("FORWARD")
+                elif center_x < z4:
+                    send_burst("RIGHT", 2)
+                else:
+                    send_burst("RIGHT", 5)
+            else:
+                send_udp_if_changed("STOP")
+
         with frame_lock:
             output_frame = img.copy()
-
-        time.sleep(0.005)  # cooperative
+        time.sleep(0.005)
 
 # ===== Flask endpoints and video generator =====
 HTML_PAGE = """
