@@ -11,21 +11,22 @@ import mediapipe as mp
 ESP8266_IP = "10.30.152.186"  # robot UDP IP
 ESP8266_PORT = 8888
 
-FRAME_W = 400
-FRAME_H = 300
+FRAME_W = 320
+FRAME_H = 240
 
 # timings & tuning
-CMD_MIN_INTERVAL = 0.12     # seconds
+CMD_MIN_INTERVAL = 0.08     # seconds
 SCAN_WAIT = 1.0             # seconds: wait after a single-turn for fresh frames
 TURN_STEP_MS = 350          # ESP single-turn duration (ms)
 MAX_SCAN_STEPS = 12         # how many steps to try scanning 360
-SMOOTH_WINDOW = 4
+SMOOTH_WINDOW = 3
+FRAME_SKIP = 1              # process every Nth frame
 
 # visibility thresholds
-SHOULDER_VIS = 0.4
-KNEE_VIS = 0.3
-ANKLE_VIS = 0.3
-NOSE_VIS = 0.3
+SHOULDER_VIS = 0.3
+KNEE_VIS = 0.2
+ANKLE_VIS = 0.2
+NOSE_VIS = 0.25
 
 # ===== GLOBALS =====
 app = Flask(__name__)
@@ -43,7 +44,8 @@ last_sent_cmd = None
 # mediapipe
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose(static_image_mode=False, model_complexity=0,
-                    min_detection_confidence=0.45, min_tracking_confidence=0.4)
+                    min_detection_confidence=0.3, min_tracking_confidence=0.3,
+                    enable_segmentation=False, smooth_landmarks=True)
 
 # ===== Pi Camera via rpicam-vid TCP stream =====
 import subprocess
@@ -53,7 +55,7 @@ import os
 print("[CAMERA] Starting rpicam-vid...")
 rpicam_process = subprocess.Popen([
     'rpicam-vid', '-t', '0', '--width', '640', '--height', '480',
-    '--framerate', '30', '--inline', '--listen', '-o', 'tcp://0.0.0.0:8080'
+    '--framerate', '20', '--inline', '--listen', '-o', 'tcp://0.0.0.0:8080'
 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 time.sleep(3)  # Wait for camera to start
@@ -114,6 +116,8 @@ def tracking_loop():
     global output_frame, current_mode
     smooth_buf = []
     scan_step_count = 0
+    frame_count = 0
+    last_ultrasonic_state = None
 
     while running:
         ret, frame = camera.read()
@@ -128,36 +132,40 @@ def tracking_loop():
             mode_now = current_mode
 
         if mode_now == "AUTO":
-            # pose detection
-            image_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            results = pose.process(image_rgb)
+            frame_count += 1
             detected = False
             legs = False
             cx = None
+            
+            # Skip frames for performance
+            if frame_count % FRAME_SKIP == 0:
+                # pose detection
+                image_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                results = pose.process(image_rgb)
 
-            if results.pose_landmarks:
-                lm = results.pose_landmarks.landmark
-                # leg detection: use knees/ankles visibility
-                left_knee = lm[mp_pose.PoseLandmark.LEFT_KNEE]
-                right_knee = lm[mp_pose.PoseLandmark.RIGHT_KNEE]
-                left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
-                right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
-                legs = ((left_knee.visibility >= KNEE_VIS) or (right_knee.visibility >= KNEE_VIS) or
-                        (left_ankle.visibility >= ANKLE_VIS) or (right_ankle.visibility >= ANKLE_VIS))
+                if results.pose_landmarks:
+                    lm = results.pose_landmarks.landmark
+                    # leg detection: use knees/ankles visibility
+                    left_knee = lm[mp_pose.PoseLandmark.LEFT_KNEE]
+                    right_knee = lm[mp_pose.PoseLandmark.RIGHT_KNEE]
+                    left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
+                    right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
+                    legs = ((left_knee.visibility >= KNEE_VIS) or (right_knee.visibility >= KNEE_VIS) or
+                            (left_ankle.visibility >= ANKLE_VIS) or (right_ankle.visibility >= ANKLE_VIS))
 
-                cx = compute_center_x_from_pose(lm, W)
-                if cx is not None:
-                    smooth_buf.append(cx)
-                    if len(smooth_buf) > SMOOTH_WINDOW:
-                        smooth_buf.pop(0)
-                    cx = int(sum(smooth_buf) / len(smooth_buf))
-                    detected = True
+                    cx = compute_center_x_from_pose(lm, W)
+                    if cx is not None:
+                        smooth_buf.append(cx)
+                        if len(smooth_buf) > SMOOTH_WINDOW:
+                            smooth_buf.pop(0)
+                        cx = int(sum(smooth_buf) / len(smooth_buf))
+                        detected = True
 
-            # ultrasonic control: enable only when legs visible
-            if legs:
-                send_udp_once("ULTRASONIC_ON")
-            else:
-                send_udp_once("ULTRASONIC_OFF")
+                # ultrasonic control: send only on state change
+                ultrasonic_state = "ULTRASONIC_ON" if legs else "ULTRASONIC_OFF"
+                if ultrasonic_state != last_ultrasonic_state:
+                    send_udp_once(ultrasonic_state)
+                    last_ultrasonic_state = ultrasonic_state
 
             if detected and legs:
                 # reset scanning
