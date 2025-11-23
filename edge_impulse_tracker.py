@@ -220,17 +220,8 @@ try:
         else:
             sock.sendto("STOP".encode(), (ESP8266_IP, ESP8266_PORT))
 
-        # Visuals
-        cv2.line(image_bgr, (int(ZONE_FAR_LEFT), 0), (int(ZONE_FAR_LEFT), H_orig), (0,0,255), 1)
-        cv2.line(image_bgr, (int(ZONE_SLIGHT_LEFT), 0), (int(ZONE_SLIGHT_LEFT), H_orig), (255,255,0), 1)
-        cv2.line(image_bgr, (int(ZONE_SLIGHT_RIGHT), 0), (int(ZONE_SLIGHT_RIGHT), H_orig), (255,255,0), 1)
-        cv2.line(image_bgr, (int(ZONE_FAR_RIGHT), 0), (int(ZONE_FAR_RIGHT), H_orig), (0,0,255), 1)
-        
-        cv2.putText(image_bgr, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow('EI Custom Tracker', image_bgr)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # Print status only
+        print(f"[{status}] Detected: {detected}, Confidence: {max_val if is_fomo and detected else 'N/A'}")
 
 except KeyboardInterrupt:
     pass
@@ -239,4 +230,3 @@ finally:
         os.remove(tmp_img)
     sock.sendto("STOP".encode(), (ESP8266_IP, ESP8266_PORT))
     sock.close()
-    cv2.destroyAllWindows()
