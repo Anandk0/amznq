@@ -25,7 +25,18 @@ FRAME_H = 240
 
 # TFLite model
 MODEL_PATH = "ei-model.tflite"
-CONFIDENCE_THRESHOLD = 0.75
+CONFIDENCE_THRESHOLD = 0.3
+
+# Speed control variables
+forward_speed = 150  # Default forward speed (0-255)
+turn_speed = 80      # Default turn speed (0-255)
+
+# Target tracking variables
+DEBOUNCE_FRAMES = 5
+SEARCH_FRAMES = 15
+frames_without_detection = 0
+last_known_x = None
+target_locked = False
 
 CMD_MIN_INTERVAL = 0.08
 FRAME_SKIP = 2
@@ -63,7 +74,7 @@ import os
 print("[CAMERA] Starting rpicam-vid...")
 rpicam_process = subprocess.Popen([
     'rpicam-vid', '-t', '0', '--width', '640', '--height', '480',
-    '--framerate', '20', '--inline', '--listen', '-o', 'tcp://0.0.0.0:8080'
+    '--framerate', '20', '--inline', '--listen', '--nopreview', '-o', 'tcp://0.0.0.0:8080'
 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 time.sleep(3)  # Wait for camera to start
@@ -80,6 +91,17 @@ def send_burst(command, times, delay=0.05):
         sock.sendto(command.encode(), (ESP8266_IP, ESP8266_PORT))
         time.sleep(delay)
     sock.sendto("STOP".encode(), (ESP8266_IP, ESP8266_PORT))
+
+def send_speed_command(direction):
+    """Send direction command with current speed settings"""
+    global forward_speed, turn_speed
+    if direction == "FORWARD":
+        cmd = f"FORWARD:{forward_speed}"
+    elif direction in ["LEFT", "RIGHT"]:
+        cmd = f"{direction}:{turn_speed}"
+    else:
+        cmd = direction
+    sock.sendto(cmd.encode(), (ESP8266_IP, ESP8266_PORT))
 
 # ===== UDP sending helpers (rate-limited, send-on-change) =====
 def send_udp_once(cmd):
@@ -103,7 +125,7 @@ def send_udp_if_changed(cmd):
     send_udp_once(cmd)
 
 def tracking_loop():
-    global output_frame, current_mode
+    global output_frame, current_mode, frames_without_detection, last_known_x, target_locked
     frame_count = 0
 
     while running:
@@ -161,6 +183,12 @@ def tracking_loop():
                     grid_h, grid_w, _ = output_data.shape
                     center_x = int((max_x + 0.5) * (W / grid_w))
                     center_y = int((max_y + 0.5) * (H / grid_h))
+                    
+                    # Update tracking
+                    last_known_x = center_x
+                    frames_without_detection = 0
+                    target_locked = True
+                    
                     cv2.circle(img, (center_x, center_y), 12, (0, 255, 0), 2)
             else:
                 boxes = interpreter.get_tensor(output_details[0]['index'])[0]
@@ -171,22 +199,46 @@ def tracking_loop():
                     center_x = int((xmin + xmax) / 2 * W)
                     center_y = int((ymin + ymax) / 2 * H)
                     detected = True
+                    
+                    # Update tracking
+                    last_known_x = center_x
+                    frames_without_detection = 0
+                    target_locked = True
+                    
                     cv2.rectangle(img, (int(xmin*W), int(ymin*H)), (int(xmax*W), int(ymax*H)), (0,255,0), 2)
 
-            # Control logic
-            if detected:
+            # Target tracking logic
+            if not detected:
+                frames_without_detection += 1
+            
+            # Use last known position if recently lost
+            tracking_x = center_x if detected else last_known_x
+            
+            # Control logic with tracking
+            if detected or (target_locked and frames_without_detection < DEBOUNCE_FRAMES):
                 z1 = W * 0.25; z2 = W * 0.40; z3 = W * 0.60; z4 = W * 0.75
-                if center_x < z1:
-                    send_burst("LEFT", 5)
-                elif center_x < z2:
-                    send_burst("LEFT", 2)
-                elif center_x <= z3:
-                    send_udp_if_changed("FORWARD")
-                elif center_x < z4:
-                    send_burst("RIGHT", 2)
+                if tracking_x and tracking_x < z1:
+                    send_speed_command("LEFT")
+                    time.sleep(0.1)
+                    send_udp_once("STOP")
+                elif tracking_x and tracking_x < z2:
+                    send_speed_command("LEFT")
+                    time.sleep(0.05)
+                    send_udp_once("STOP")
+                elif tracking_x and tracking_x <= z3:
+                    send_speed_command("FORWARD")
+                elif tracking_x and tracking_x < z4:
+                    send_speed_command("RIGHT")
+                    time.sleep(0.05)
+                    send_udp_once("STOP")
                 else:
-                    send_burst("RIGHT", 5)
+                    send_speed_command("RIGHT")
+                    time.sleep(0.1)
+                    send_udp_once("STOP")
             else:
+                if frames_without_detection > SEARCH_FRAMES:
+                    target_locked = False
+                    last_known_x = None
                 send_udp_if_changed("STOP")
 
         with frame_lock:
@@ -208,6 +260,11 @@ HTML_PAGE = """
     .btn-danger{background:#dc3545;color:#fff}
     .rc{display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap}
     .dir{width:60px;height:60px;border-radius:6px;background:#333;color:#fff;font-size:20px}
+    .speed-control{margin:20px auto;max-width:400px;padding:20px;background:#222;border-radius:10px}
+    .slider-container{margin:15px 0;text-align:left}
+    .slider{width:100%;height:25px;border-radius:5px;background:#444;outline:none;-webkit-appearance:none}
+    .slider::-webkit-slider-thumb{appearance:none;width:25px;height:25px;border-radius:50%;background:#1e90ff;cursor:pointer}
+    .slider::-moz-range-thumb{width:25px;height:25px;border-radius:50%;background:#1e90ff;cursor:pointer;border:none}
   </style>
 </head>
 <body>
@@ -219,13 +276,25 @@ HTML_PAGE = """
   <button class="btn btn-mode" onclick="setMode('AUTO')">ENABLE AUTO TRACKING</button>
   <button class="btn btn-mode btn-danger" onclick="setMode('MANUAL')">SWITCH TO MANUAL</button>
 
+  <div class="speed-control">
+    <h3>Speed Control</h3>
+    <div class="slider-container">
+      <label>Forward Speed: <span id="forward-value">{{ forward_speed }}</span></label>
+      <input type="range" min="50" max="255" value="{{ forward_speed }}" class="slider" id="forward-speed" oninput="updateSpeed('forward', this.value)">
+    </div>
+    <div class="slider-container">
+      <label>Turn Speed: <span id="turn-value">{{ turn_speed }}</span></label>
+      <input type="range" min="30" max="150" value="{{ turn_speed }}" class="slider" id="turn-speed" oninput="updateSpeed('turn', this.value)">
+    </div>
+  </div>
+
   <div id="rc" style="display:{{ 'block' if mode=='MANUAL' else 'none' }};">
     <h3>Remote Control</h3>
     <div class="rc">
-      <button class="dir" onmousedown="send('FORWARD')" onmouseup="send('STOP')">▲</button>
-      <button class="dir" onmousedown="send('LEFT')" onmouseup="send('STOP')">◀</button>
+      <button class="dir" onmousedown="sendWithSpeed('FORWARD')" onmouseup="send('STOP')">▲</button>
+      <button class="dir" onmousedown="sendWithSpeed('LEFT')" onmouseup="send('STOP')">◀</button>
       <button class="dir" onmousedown="send('STOP')" onmouseup="send('STOP')">■</button>
-      <button class="dir" onmousedown="send('RIGHT')" onmouseup="send('STOP')">▶</button>
+      <button class="dir" onmousedown="sendWithSpeed('RIGHT')" onmouseup="send('STOP')">▶</button>
       <button class="dir" onmousedown="send('BACKWARD')" onmouseup="send('STOP')">▼</button>
     </div>
     <br/>
@@ -233,11 +302,29 @@ HTML_PAGE = """
   </div>
 
 <script>
+let forwardSpeed = {{ forward_speed }};
+let turnSpeed = {{ turn_speed }};
+
 function setMode(m){
   fetch('/set_mode/' + m).then(()=> location.reload());
 }
 function send(cmd){
   fetch('/control/' + cmd);
+}
+function sendWithSpeed(direction){
+  let speed = direction === 'FORWARD' ? forwardSpeed : turnSpeed;
+  fetch('/control/' + direction + ':' + speed);
+}
+function updateSpeed(type, value){
+  if(type === 'forward'){
+    forwardSpeed = value;
+    document.getElementById('forward-value').textContent = value;
+    fetch('/set_speed/forward/' + value);
+  } else {
+    turnSpeed = value;
+    document.getElementById('turn-value').textContent = value;
+    fetch('/set_speed/turn/' + value);
+  }
 }
 function testBackward(){
   send('BACKWARD');
@@ -252,7 +339,7 @@ function testBackward(){
 def index():
     with mode_lock:
         mode = current_mode
-    return render_template_string(HTML_PAGE, mode=mode)
+    return render_template_string(HTML_PAGE, mode=mode, forward_speed=forward_speed, turn_speed=turn_speed)
 
 @app.route('/video_feed')
 def video_feed():
@@ -273,6 +360,15 @@ def control(cmd):
         if current_mode == "MANUAL":
             # direct immediate command (single send). The ESP implements safety timeout.
             send_udp_once(cmd.upper())
+    return "OK"
+
+@app.route('/set_speed/<speed_type>/<int:value>')
+def set_speed(speed_type, value):
+    global forward_speed, turn_speed
+    if speed_type == 'forward':
+        forward_speed = max(50, min(255, value))
+    elif speed_type == 'turn':
+        turn_speed = max(30, min(150, value))
     return "OK"
 
 def generate():
